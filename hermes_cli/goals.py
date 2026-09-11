@@ -37,6 +37,9 @@ DEFAULT_JUDGE_TIMEOUT = 30.0
 DEFAULT_JUDGE_MAX_TOKENS = 4096
 # Cap how much of the last response we send to the judge.
 _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
+# Char budget for the GOAL text (card body) in the judge prompt. Configurable:
+# auxiliary.goal_judge.goal_max_chars (see _goal_judge_goal_max_chars).
+_JUDGE_GOAL_CHARS = 2000
 # Consecutive judge *parse* failures (empty / non-JSON) before the loop auto-pauses and points at
 # the goal_judge config. API/transport errors do NOT count — those are tracked separately below.
 # Guards against small models that cannot follow the strict JSON contract burning the whole budget.
@@ -768,6 +771,18 @@ def _goal_judge_max_tokens() -> int:
     return _goal_judge_setting("max_tokens", DEFAULT_JUDGE_MAX_TOKENS, int)
 
 
+def _goal_judge_goal_max_chars() -> int:
+    """Char budget for the goal text in the judge prompt.
+
+    A card body IS the worker's contract; truncating it at a hardcoded 2000 chars
+    meant long cards were judged against half a contract (acceptance criteria at
+    the bottom were invisible to the judge). Default stays 2000 for upstream
+    compatibility; installs with long-form cards raise it via
+    ``auxiliary.goal_judge.goal_max_chars``.
+    """
+    return _goal_judge_setting("goal_max_chars", _JUDGE_GOAL_CHARS, int)
+
+
 def _goal_judge_timeout() -> float:
     return _goal_judge_setting("timeout", DEFAULT_JUDGE_TIMEOUT, float)
 
@@ -925,7 +940,7 @@ def judge_goal(
     # block as extra criteria so the judge sees a single source of truth.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
     common = dict(
-        goal=_truncate(goal, 2000),
+        goal=_truncate(goal, _goal_judge_goal_max_chars()),
         response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
         background_block=_render_background_block(background_processes)
         + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),
