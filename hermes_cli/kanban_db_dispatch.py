@@ -83,6 +83,10 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
+# Memoization cache for _cited_pr_terminal — one gh state probe per PR per
+# dispatcher process (a ready-card sweep can cite the same PR many times).
+_CITED_PR_STATE_CACHE: dict = {}
+
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
@@ -1639,9 +1643,22 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
-    pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
-                                          cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
+    pr_times = []
+    for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
+                            cols=", body", unreadable=now):  # duplicate-PR risk: fail closed
+        body = _kb._lossy_text(c["body"]) or ""
+        cited = _RESPAWN_GUARD_PR_URL_RE.findall(body)
+        if not cited:
+            continue
+        # A comment whose every cited PR is now terminal (MERGED/CLOSED) is
+        # dropped — the duplicate-PR risk the guard exists for is moot once
+        # the PR merged (deploy cards exist BECAUSE their PR merged and were
+        # held ready-but-undispatchable on the merged PR's own URL, #111910
+        # wave). gh/network failure keeps the comment guarding (fail closed:
+        # an uncheckable PR is treated as still open).
+        if _all_cited_prs_terminal(cited):
+            continue
+        pr_times.append(t)
     if pr_times:
         # Strictly after: a same-second tie stays guarded (fail closed).
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
@@ -1651,6 +1668,45 @@ def check_respawn_guard(
         return "active_pr"
 
     return None
+
+
+def _cited_pr_terminal(url: str) -> bool:
+    """True when the GitHub PR url is in a terminal state (MERGED or CLOSED).
+
+    Memoized per-process by URL: the guard can call this per ready card per
+    tick and one PR is typically cited by several cards. gh/network failure
+    returns False (fail closed: an uncheckable PR is treated as still open,
+    preserving the guard's duplicate-PR protection).
+    """
+    cache = _CITED_PR_STATE_CACHE
+    if url in cache:
+        return cache[url]
+    m = re.match(r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)", url, re.IGNORECASE)
+    if not m:
+        cache[url] = False
+        return False
+    slug = f"{m.group(1)}/{m.group(2)}"
+    num = m.group(3)
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "view", num, "--repo", slug, "--json", "state"],
+            capture_output=True, timeout=20, check=False,
+        )
+        if r.returncode != 0:
+            cache[url] = False
+            return False
+        import json as _json
+        state = (_json.loads(r.stdout.decode("utf-8", "replace") or "{}") or {}).get("state")
+        ok = state in ("MERGED", "CLOSED")
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        ok = False
+    cache[url] = ok
+    return ok
+
+
+def _all_cited_prs_terminal(urls: list) -> bool:
+    """True when EVERY cited PR URL is terminal (MERGED or CLOSED)."""
+    return all(_cited_pr_terminal(u) for u in urls)
 
 
 _GUARD_TIME_COLS = {"task_runs": "ended_at", "task_events": "created_at", "task_comments": "created_at"}
