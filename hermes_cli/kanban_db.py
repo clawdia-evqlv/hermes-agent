@@ -3195,9 +3195,30 @@ def block_task(
         if kind == "dependency" and _parents_satisfied(conn, task_id):
             kind = "needs_input"
             rekind_reason = "no_open_parent"
+        # Gate-progression support (see _route_block): pull the reason of the
+        # PREVIOUS blocked event so a re-block naming a different PR/card set
+        # (forward motion in a gate chain) resets the loop counter instead of
+        # tripping the breaker at BLOCK_RECURRENCE_LIMIT.
+        prev_reason_row = conn.execute(
+            """
+            SELECT payload FROM task_events
+            WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        try:
+            prev_reason = (
+                json.loads(prev_reason_row["payload"] or "{}").get("reason")
+                if prev_reason_row is not None
+                else None
+            )
+        except (json.JSONDecodeError, TypeError):
+            prev_reason = None
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            prev_reason=prev_reason,
         )
         if rekind_reason:
             payload["requested_kind"] = requested_kind
@@ -3231,9 +3252,27 @@ def block_task(
     return True
 
 
+def _block_reason_gate_signature(reason: Optional[str]) -> str:
+    """Signature of the external gate a block reason names (PRs + upstream cards).
+
+    Used by _route_block to tell gate PROGRESSION from a stuck loop: a re-block
+    of the same kind whose reason now names a different set of PR numbers /
+    upstream card ids has moved on to the next gate in a chain (e.g. blocked on
+    PR #119 -> released -> blocked on PR #127) — that is forward motion, not a
+    loop, so the recurrence counter resets. Only digits and t_ ids count; prose
+    differences alone do not (copy edits must not reset the loop breaker).
+    """
+    if not reason:
+        return ""
+    prs = sorted(set(re.findall(r"PR\s*#(\d+)", reason, re.IGNORECASE)))
+    cards = sorted(set(re.findall(r"\bt_[0-9a-f]{8}\b", reason)))
+    return ",".join(prs) + "|" + ",".join(cards)
+
+
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
     prev_kind: Optional[str], prev_recurrences: int,
+    prev_reason: Optional[str] = None,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3245,15 +3284,30 @@ def _route_block(
     recurrences: block_task only fires from running/ready (AFTER an unblock
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
-    (un-typed None compares equal to a prior un-typed block). At
+    (un-typed None compares equal to a prior un-typed block). EXCEPT when the
+    named gate set changed (progression, see
+    :func:`_block_reason_gate_signature`) — that resets the count. At
     ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
-    recurrences = prev_recurrences + 1 if prev_kind == kind else 1
+    progressed = (
+        prev_kind == kind
+        and prev_reason is not None
+        and reason is not None
+        and _block_reason_gate_signature(prev_reason)
+        != _block_reason_gate_signature(reason)
+    )
+    recurrences = 1 if progressed else (prev_recurrences + 1 if prev_kind == kind else 1)
+    payload["gate_progression"] = True if progressed else None
+    if progressed:
+        payload["gate_progression_detail"] = {
+            "prev": _block_reason_gate_signature(prev_reason),
+            "current": _block_reason_gate_signature(reason),
+        }
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
-    payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+    payload = {**payload, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
